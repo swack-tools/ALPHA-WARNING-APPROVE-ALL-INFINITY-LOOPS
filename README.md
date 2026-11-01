@@ -98,6 +98,8 @@ The reviewer can't lift these. Edit `NEVER` in the script to change them.
 | `money` | Payments, purchases, credit cards, wire transfers, trading |
 | `outbound` | Sending or publishing email, tweets, newsletters, press releases, anything to customers or the public |
 
+`secret` and `hands-on` check the question being asked. The other four also check the session's whole last message, so a mention of a production deploy above an unrelated question opens the dialog too.
+
 These are pattern matches: a safety net, not a guarantee. `APPROVE_ALL_NO_GUARD=1` in the real environment removes all but `secret` and `hands-on`. `.env` can't set it.
 
 Sessions also come back to you when they repeat a question after being answered, reach 25 auto-replies since you last wrote, go 3 turns without doing any work, or write so much transcript since the last reply that the count can't be found. Scripted runs (`claude -p`, the SDK) are left alone.

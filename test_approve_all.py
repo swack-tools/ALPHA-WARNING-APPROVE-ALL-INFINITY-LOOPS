@@ -143,6 +143,26 @@ class Guards(unittest.TestCase):
                              ("Should I send the email to customers?", "outbound")]:
             self.assertEqual(decide(said(text)).get("reason"), reason, text)
 
+    FILLER = " This is a long explanation of the plan." * 40
+
+    def test_an_action_far_above_the_question_is_still_guarded(self):
+        d = decide(said(f"I propose to run rm -rf /data.{self.FILLER}\n\nShould I proceed?"))
+        self.assertEqual(d["reason"], "destructive, earlier in its message")
+
+    def test_an_action_in_the_recap_is_guarded(self):
+        d = decide(tool("mcp__ccd_turn__wrap_up", recap="Ready to drop table users.", ask="Go ahead?",
+                        actions=[{"label": "Yes", "message": "Yes."}]))
+        self.assertEqual(d["reason"], "destructive, earlier in its message")
+
+    def test_the_guard_on_earlier_text_also_binds_the_reviewer(self):
+        with mock.patch.object(aa, "can_review", lambda: True), mock.patch.object(
+                aa, "ask_model", lambda prompt: verdict(message="Yes, go ahead.")):
+            d = decide(said(f"I'll deploy to production.{self.FILLER}\n\nShould I proceed?"))
+        self.assertEqual(d["reason"], "production, earlier in its message")
+
+    def test_a_secret_mentioned_earlier_does_not_stop_it(self):
+        self.assertIn("reply", decide(said(f"The API key is in .env.{self.FILLER}\n\nShould I open the PR?")))
+
     def test_mentioning_prod_is_fine(self):
         self.assertIn("reply", decide(said("Prod wasn't touched or restarted. Want me to keep the preview up?")))
 
@@ -319,6 +339,17 @@ class Review(unittest.TestCase):
         q = {"question": "Which?", "options": [{"label": "red"}, {"label": "blue (Recommended)"}]}
         out = aa.on_ask({"tool_input": {"questions": [q]}})["hookSpecificOutput"]
         self.assertEqual(out["updatedInput"]["answers"], {"Which?": "red"})
+
+    def test_card_reviewer_reads_the_descriptions(self):
+        model = self.answer(verdict(index=1))
+        q = {"question": "Which layout?", "options": [{"label": "Option A (Recommended)", "description": "One shared table"},
+                                                      {"label": "Option B", "description": "A table per tenant"},
+                                                      {"label": "Option C"}]}
+        out = aa.on_ask({"tool_input": {"questions": [q]}})["hookSpecificOutput"]
+        self.assertEqual(out["updatedInput"]["answers"], {"Which layout?": "Option B"})
+        prompt = model.call_args[0][0]
+        for expected in ("0: Option A (Recommended): One shared table", "1: Option B: A table per tenant", "2: Option C\n"):
+            self.assertIn(expected, prompt)
 
     def test_card_left_for_you(self):
         self.answer(verdict("leave_for_user"))
@@ -719,6 +750,15 @@ class Failures(unittest.TestCase):
             finally:
                 resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
         create.assert_not_called()
+
+    def test_check_works_on_a_fresh_install(self):
+        state = Path(self.folder, "new", "state")
+        with mock.patch.object(aa, "STATE", state), mock.patch.object(aa, "SPEND", state / "spend.jsonl"), mock.patch.object(
+                aa, "LOG", state / "log.jsonl"), mock.patch.dict(aa.ENV_FILE, {"ANTHROPIC_API_KEY": "k"}), mock.patch.dict(
+                sys.modules, {"anthropic": fake_sdk(lambda **_: fake_response(json.dumps(verdict())))}), mock.patch(
+                "sys.stdout", io.StringIO()) as out:
+            aa.cmd_check(None)
+        self.assertIn("spent so far: $0.0060", out.getvalue())
 
     def test_the_write_check_leaves_the_total_alone(self):
         aa.SPEND.write_text('{"cost": 1.5}\n')

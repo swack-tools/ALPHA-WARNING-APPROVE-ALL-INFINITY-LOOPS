@@ -201,6 +201,8 @@ NEVER = {
 }
 if os.environ.get("APPROVE_ALL_NO_GUARD"):
     NEVER = {name: NEVER[name] for name in ("secret", "hands-on")}
+# Things a session might do, which it can describe long before its closing question. The other two are about the ask.
+ACTIONS = ("production", "destructive", "money", "outbound")
 
 NEEDS_YOU = re.compile(
     r"\?\s*$"
@@ -344,9 +346,9 @@ def suggested_answers(turn, verdict, ask):
     return answers[:6]
 
 
-def blocked_by(text):
+def blocked_by(text, only=None):
     for name, pattern in NEVER.items():
-        if re.search(pattern, text, FLAGS):
+        if (only is None or name in only) and re.search(pattern, text, FLAGS):
             return name
     return None
 
@@ -509,6 +511,7 @@ def can_review():
 
 def check_ledger_writes():
     """Raises if the ledger won't take a write. Opening it isn't proof: a full disk opens fine. Blank lines are skipped."""
+    STATE.mkdir(parents=True, exist_ok=True)
     with SPEND.open("a") as f:
         f.write("\n")
 
@@ -638,6 +641,10 @@ def decide(turn, rows=(), cwd=""):
     guard = blocked_by(f"{ask}\n{reply}")
     if guard:
         return for_you(guard)
+    recap = (turn["wrap"] or {}).get("recap") or ""
+    guard = blocked_by(f"{turn['said']}\n{turn['post']}\n{recap}", ACTIONS)
+    if guard:
+        return for_you(f"{guard}, earlier in its message")
     if not turn["counted"]:
         return for_you("too much has happened since the last reply to count replies")
 
@@ -692,7 +699,9 @@ def pick_answer(question, rows, cwd):
     labels = [o["label"] for o in options]
     verdict = None
     if options and not question.get("multiSelect") and can_review():
-        verdict = ask_model(build_prompt(question.get("question", ""), labels, rows, cwd))
+        # Same order as labels, so the reviewer's index still names the right answer.
+        described = [f"{o['label']}: {o['description']}" if o.get("description") else o["label"] for o in options]
+        verdict = ask_model(build_prompt(question.get("question", ""), described, rows, cwd))
     if verdict and verdict.get("action") == "leave_for_user":
         return "", verdict.get("reason") or "the reviewer left this for you"
     index = verdict.get("option_index", -1) if verdict and verdict.get("action") == "reply" else -1

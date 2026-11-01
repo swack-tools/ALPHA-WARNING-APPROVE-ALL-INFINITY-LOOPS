@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -169,6 +170,30 @@ class Limits(unittest.TestCase):
         d = decide(auto_reply(n=4), tool("Bash"), said("Red?"))
         self.assertEqual(aa.TAG.search(d["reply"])[1], "5")
 
+    def test_no_message_or_tag_in_reach_hands_back(self):
+        self.assertIn("count replies", aa.decide(aa.read_turn([said("Red?")]))["reason"])
+
+    def big_gap(self, *rows):
+        result = {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x" * 4_100_000}]}}
+        path = Path(tempfile.mkdtemp(dir=TMP), "t.jsonl")
+        path.write_text("\n".join(json.dumps(r) for r in [human("start"), *rows, result, tool("Bash"), said("Red?")]) + "\n")
+        return aa.on_stop({"transcript_path": str(path), "session_id": "s", "cwd": "/x"})
+
+    def test_a_large_tool_result_cannot_reset_the_reply_count(self):
+        self.assertIsNone(self.big_gap(auto_reply(n=aa.MAX_REPLIES)))
+        self.assertIn("hit 25 replies", aa.LOG.read_text().splitlines()[-1])
+
+    def test_a_large_tool_result_still_gets_the_next_count(self):
+        self.assertEqual(aa.TAG.search(self.big_gap(auto_reply(n=4))["reason"])[1], "5")
+
+    def test_a_large_first_turn_is_still_answered(self):
+        self.assertEqual(aa.TAG.search(self.big_gap()["reason"])[1], "1")
+
+    def test_when_the_count_is_out_of_reach_it_hands_back(self):
+        with mock.patch.object(aa, "FAR_BACK", 4_000_000):
+            self.assertIsNone(self.big_gap(auto_reply(n=aa.MAX_REPLIES)))
+        self.assertIn("count replies", aa.LOG.read_text().splitlines()[-1])
+
     def test_tool_output_quoting_a_tag_does_not_count(self):
         quoted = {"type": "user", "message": {"content": [
             {"type": "tool_result", "content": "[approve-all n=25 idle=2 id=abc | x]"}]}}
@@ -187,6 +212,23 @@ class Hooks(unittest.TestCase):
         out = aa.on_ask({"tool_input": {"questions": [q]}})["hookSpecificOutput"]
         self.assertEqual(out["updatedInput"]["answers"], {"Which?": "red"})
 
+    def test_single_select_gets_exactly_one_real_option(self):
+        q = {"question": "Which?", "options": [{"label": "Quick (Recommended)"}, {"label": "Thorough (not recommended)"},
+                                               {"label": "Other (Recommended)"}]}
+        out = aa.on_ask({"tool_input": {"questions": [q]}})["hookSpecificOutput"]
+        self.assertEqual(out["updatedInput"]["answers"], {"Which?": "Quick (Recommended)"})
+
+    def test_multi_select_takes_every_recommended_option(self):
+        q = {"question": "Which?", "multiSelect": True,
+             "options": [{"label": "A (Recommended)"}, {"label": "B (not recommended)"}, {"label": "C (Recommended)"}]}
+        out = aa.on_ask({"tool_input": {"questions": [q]}})["hookSpecificOutput"]
+        self.assertEqual(out["updatedInput"]["answers"], {"Which?": "A (Recommended), C (Recommended)"})
+
+    def test_never_defaults_to_an_option_marked_not_recommended(self):
+        q = {"question": "Which?", "options": [{"label": "A (not recommended)"}, {"label": "B"}]}
+        out = aa.on_ask({"tool_input": {"questions": [q]}})["hookSpecificOutput"]
+        self.assertEqual(out["updatedInput"]["answers"], {"Which?": "B"})
+
     def test_ask_guarded(self):
         q = {"question": "Deploy to production?", "options": [{"label": "Yes (Recommended)"}]}
         self.assertIsNone(aa.on_ask({"tool_input": {"questions": [q]}}))
@@ -197,6 +239,10 @@ class Hooks(unittest.TestCase):
 
     def test_permission_guarded(self):
         self.assertIsNone(aa.on_permission({"tool_name": "Bash", "tool_input": {"command": "rm -rf /data"}}))
+
+    def test_guard_reads_the_whole_permission_input(self):
+        command = f"echo {'x' * 100_000}; rm -rf /data"
+        self.assertIsNone(aa.on_permission({"tool_name": "Bash", "tool_input": {"command": command}}))
 
 
 def verdict(action="reply", index=-1, message="", reason="because"):
@@ -282,6 +328,22 @@ class Review(unittest.TestCase):
     def test_permission_left_for_you(self):
         self.answer(verdict("leave_for_user"))
         self.assertIsNone(aa.on_permission({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+
+    def test_reviewer_is_told_when_a_huge_input_is_cut(self):
+        model = self.answer(verdict("reply"))
+        command = f"START {'x' * 100_000} END"
+        aa.on_permission({"tool_name": "Bash", "tool_input": {"command": command}})
+        prompt = model.call_args[0][0]
+        for expected in ("START", "END", "characters not shown"):
+            self.assertIn(expected, prompt)
+        self.assertLess(len(prompt), 45_000)
+
+    def test_reviewer_sees_all_of_a_normal_input(self):
+        model = self.answer(verdict("reply"))
+        command = f"START {'x' * 30_000} END"
+        aa.on_permission({"tool_name": "Bash", "tool_input": {"command": command}})
+        self.assertIn(command, model.call_args[0][0])
+        self.assertNotIn("not shown", model.call_args[0][0])
 
     def test_permission_allowed_when_review_fails(self):
         self.answer(None)
@@ -647,6 +709,22 @@ class Failures(unittest.TestCase):
             self.assertEqual(aa.spent(), float("inf"))
             self.assertFalse(aa.can_review())
 
+    def test_no_paid_review_when_the_ledger_rejects_writes(self):
+        create = mock.Mock(return_value=fake_response(json.dumps(verdict())))
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_sdk(create)}):
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, hard))
+            try:
+                self.assertIsNone(aa.ask_model("x"))
+            finally:
+                resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        create.assert_not_called()
+
+    def test_the_write_check_leaves_the_total_alone(self):
+        aa.SPEND.write_text('{"cost": 1.5}\n')
+        aa.check_ledger_writes()
+        self.assertAlmostEqual(aa.spent(), 1.5)
+
     def test_missing_sdk_falls_back(self):
         with mock.patch.dict(sys.modules, {"anthropic": None}):
             self.assertIsNone(aa.ask_model("x"))
@@ -800,6 +878,21 @@ class Install(unittest.TestCase):
                     command(None)
                 self.assertEqual(aa.SETTINGS.read_text(), text)
                 self.assertFalse(backup.exists())
+
+    def test_keeps_other_commands_that_share_a_group(self):
+        other = {"type": "command", "command": "other"}
+        ours = {"type": "command", "command": self.OLD}
+        aa.SETTINGS.write_text(json.dumps({"hooks": {
+            "Stop": [{"hooks": [ours, other], "matcher": "x"}, {"hooks": [ours]}],
+            "PreToolUse": [{"hooks": [other]}]}}))
+        aa.cmd_uninstall(None)
+        self.assertEqual(json.loads(aa.SETTINGS.read_text()), {"hooks": {
+            "Stop": [{"hooks": [other], "matcher": "x"}], "PreToolUse": [{"hooks": [other]}]}})
+        aa.SETTINGS.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [ours, other]}]}}))
+        aa.cmd_install(None)
+        self.assertEqual(self.installed()[0], "other")
+        self.assertEqual(len(self.installed()), 2)
+        self.assertNotIn(".venv", self.installed()[1])
 
     def test_leaves_odd_hooks_it_does_not_own_alone(self):
         odd = [{"hooks": 5}, "text", {"hooks": ["text", {"command": 7}]}]

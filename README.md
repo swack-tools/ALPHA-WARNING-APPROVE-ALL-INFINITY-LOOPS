@@ -100,7 +100,7 @@ The reviewer can't lift these. Edit `NEVER` in the script to change them.
 
 These are pattern matches: a safety net, not a guarantee. `APPROVE_ALL_NO_GUARD=1` in the real environment removes all but `secret` and `hands-on`. `.env` can't set it.
 
-Sessions also come back to you when they repeat a question after being answered, reach 25 auto-replies since you last wrote, or go 3 turns without doing any work. Scripted runs (`claude -p`, the SDK) are left alone.
+Sessions also come back to you when they repeat a question after being answered, reach 25 auto-replies since you last wrote, go 3 turns without doing any work, or write so much transcript since the last reply that the count can't be found. Scripted runs (`claude -p`, the SDK) are left alone.
 
 ## The dialog
 
@@ -120,7 +120,7 @@ No failure should crash or block a session. Check `uv run --script approve-all l
 | API error, missing SDK, bad model reply | The rules take over, and it's logged |
 | No key, or an empty one | Rules only |
 | Malformed `.env` | Bad lines are skipped, bad numbers use the default |
-| Corrupt `spend.jsonl` | Bad lines are skipped. If the file can't be read or written, reviews stop, because the cap can't be enforced |
+| Corrupt `spend.jsonl` | Bad lines are skipped. If the file can't be read or written, reviews stop before they're paid for, because the cap can't be enforced |
 | Transcript can't be read | No auto-reply when a session stops, because the loop limits are counted from it. Prompts and questions still use the rules |
 | `osascript` missing | No dialog. It's left for you in the session |
 | uv fails, or the script moved | The hook does nothing and the session stops as usual. Nothing is logged, since the script never ran |

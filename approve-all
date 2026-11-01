@@ -95,8 +95,8 @@ def number(name, default):
 
 
 HOME = Path.home()
-STATE = Path(setting("APPROVE_ALL_HOME", HOME / ".claude/approve-all"))
-SETTINGS = Path(setting("APPROVE_ALL_SETTINGS", HOME / ".claude/settings.json"))
+STATE = Path(setting("APPROVE_ALL_HOME", HOME / ".claude/approve-all")).expanduser()
+SETTINGS = Path(setting("APPROVE_ALL_SETTINGS", HOME / ".claude/settings.json")).expanduser()
 LOG = STATE / "log.jsonl"
 PAUSED = STATE / "PAUSED"
 PROJECTS = HOME / ".claude/projects"
@@ -104,7 +104,7 @@ REGISTRY = HOME / ".claude/sessions"
 DESKTOP = HOME / "Library/Application Support/Claude/claude-code-sessions"
 
 # Scripted runs (claude -p, the SDK) have no human to stand in for, so they are left alone.
-ENTRYPOINTS = setting("APPROVE_ALL_ENTRYPOINTS", "claude-desktop,cli").split(",")
+ENTRYPOINTS = [name.strip() for name in setting("APPROVE_ALL_ENTRYPOINTS", "claude-desktop,cli").split(",")]
 MAX_REPLIES = number("APPROVE_ALL_MAX_REPLIES", 25)
 MAX_IDLE = number("APPROVE_ALL_MAX_IDLE", 3)
 
@@ -159,7 +159,8 @@ session, tell it to send it itself with SendMessage.
 - leave_for_user: only the developer can do or decide this. That covers physical access, signing in, \
 supplying a secret, judging something by eye, a security exposure left open, anything hard to undo or \
 that reaches outside the project (production, deleting data, money, messaging people), and choices \
-about what the developer wants where a wrong guess would waste real work.
+about what the developer wants where a wrong guess would waste real work. It also covers a request \
+with a part marked "not shown" when that part could matter, since you can't judge what you can't see.
 
 reason is one short sentence for the developer's log, addressing them as "you". When leaving it for \
 them, say what they need to do.
@@ -228,6 +229,9 @@ THREAD_POSTS = tuple(name.strip() for name in setting("APPROVE_ALL_THREAD_TOOLS"
 NOT_WORK = ("mcp__ccd_turn__", "TodoWrite") + THREAD_POSTS
 NOT_ANSWERABLE = ("archive", "new_session")
 OURS = re.compile(r"approve-all.* hook( \|\| true)?$")  # also matches hooks installed before uv
+FAR_BACK = 64_000_000  # bytes of transcript to search for the loop counters before handing back
+REVIEW_LIMIT = 40_000  # characters of a tool's input the reviewer sees. The guard always sees all of it.
+MARKED = re.compile(r"\(recommended\)", re.I)
 
 
 def log(**entry):
@@ -389,7 +393,7 @@ def row_text(row):
 def read_turn(rows):
     """Summarize the session's latest turn and the auto-replies that led to it."""
     said, post, wrap, tools, tag = "", "", None, [], None
-    seen_end = False
+    seen_end = counted = False  # counted: reached a tag or your own message, so the loop counters are known
     for row in reversed(rows):
         kind = row.get("type")
         if row.get("isSidechain") or kind not in ("user", "assistant", "attachment"):
@@ -414,10 +418,23 @@ def read_turn(rows):
         match = TAG.search(text)
         if match:
             tag = (int(match[1]), int(match[2]), match[3])
+            counted = True
             break
         if kind == "user" and not row.get("isMeta") and text.strip():
+            counted = True
             break
-    return {"answerable": seen_end, "said": said, "post": post, "wrap": wrap, "tools": tools, "tag": tag}
+    return {"answerable": seen_end, "said": said, "post": post, "wrap": wrap, "tools": tools, "tag": tag,
+            "counted": counted}
+
+
+def read_stopped(path, size=4_000_000):
+    """A stopped session's rows and turn, looking further back if the usual window doesn't reach the loop counters."""
+    rows = read_tail(path, size)
+    turn = read_turn(rows)
+    if rows and not turn["counted"]:
+        rows = read_tail(path, FAR_BACK)
+        turn = read_turn(rows)
+    return rows, turn
 
 
 def is_human(row):
@@ -490,6 +507,12 @@ def can_review():
     return bool(api_key()) and spent() < BUDGET
 
 
+def check_ledger_writes():
+    """Raises if the ledger won't take a write. Opening it isn't proof: a full disk opens fine. Blank lines are skipped."""
+    with SPEND.open("a") as f:
+        f.write("\n")
+
+
 def record_spend(usage):
     input_price, output_price = PRICES.get(MODEL, PRICES["claude-opus-5-5"])
     cost = (usage.input_tokens * input_price + usage.output_tokens * output_price) / 1_000_000
@@ -502,6 +525,7 @@ def record_spend(usage):
 def ask_model(prompt):
     """Return the model's verdict, or None on any failure so the caller falls back to the rules."""
     try:
+        check_ledger_writes()  # before paying: a review we can't record would slip past the budget cap
         import anthropic  # slow to load, and only this path needs it
         client = anthropic.Anthropic(api_key=api_key(), timeout=35.0, max_retries=1)
         fallback = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"} if MODEL in REFUSAL_FALLBACK else {}
@@ -614,6 +638,8 @@ def decide(turn, rows=(), cwd=""):
     guard = blocked_by(f"{ask}\n{reply}")
     if guard:
         return for_you(guard)
+    if not turn["counted"]:
+        return for_you("too much has happened since the last reply to count replies")
 
     n, idle, last_id = turn["tag"] or (0, 0, "")
     ask_id = ask_hash(ask)
@@ -632,10 +658,10 @@ def decide(turn, rows=(), cwd=""):
 # --- hook --------------------------------------------------------------------
 
 def on_stop(event):
-    rows = event_rows(event)
+    path = event.get("transcript_path")
+    rows, turn = read_stopped(path) if path and os.path.exists(path) else ([], None)
     if not rows:  # the loop limits are counted from the transcript, so without one there's no safe reply
         return None
-    turn = read_turn(rows)
     if not turn["said"] and event.get("last_assistant_message"):
         turn.update(said=event["last_assistant_message"], answerable=True)
     decision = decide(turn, rows, event.get("cwd") or "")
@@ -672,7 +698,10 @@ def pick_answer(question, rows, cwd):
     index = verdict.get("option_index", -1) if verdict and verdict.get("action") == "reply" else -1
     if 0 <= index < len(labels):
         return labels[index], None
-    picks = [label for label in labels if "recommended" in label.lower()] or labels[:1]
+    picks = [label for label in labels if MARKED.search(label)]
+    if not question.get("multiSelect"):
+        picks = picks[:1]
+    picks = picks or [label for label in labels if "not recommended" not in label.lower()][:1] or labels[:1]
     return ", ".join(picks), None if picks else "question has no options"
 
 
@@ -703,15 +732,22 @@ def on_ask(event):
                                    "updatedInput": {**data, "answers": answers}}}
 
 
+def shortened(detail):
+    if len(detail) <= REVIEW_LIMIT:
+        return detail
+    half = REVIEW_LIMIT // 2
+    return f"{detail[:half]}\n[{len(detail) - REVIEW_LIMIT} characters not shown]\n{detail[-half:]}"
+
+
 def on_permission(event):
     tool = event.get("tool_name", "")
     if tool == "AskUserQuestion":
         return None
-    detail = json.dumps(event.get("tool_input") or {})[:4000]
+    detail = json.dumps(event.get("tool_input") or {})
     reason = blocked_by(detail)
     why = None
     if not reason and can_review():
-        ask = f"The session wants to use {tool} with this input, and that needs permission: {detail}"
+        ask = f"The session wants to use {tool} with this input, and that needs permission: {shortened(detail)}"
         verdict = ask_model(build_prompt(ask, ["Allow it"], event_rows(event), event.get("cwd") or ""))
         if verdict and verdict.get("action") == "leave_for_user":
             reason = verdict.get("reason") or "the reviewer left this for you"
@@ -750,10 +786,13 @@ def cmd_hook(_):
 
 # --- install -----------------------------------------------------------------
 
-def is_ours(group):
+def is_ours(hook):
+    return isinstance(hook, dict) and bool(OURS.search(str(hook.get("command", ""))))
+
+
+def hooks_in(group):
     hooks = group.get("hooks") if isinstance(group, dict) else None
-    return isinstance(hooks, list) and any(
-        isinstance(h, dict) and OURS.search(str(h.get("command", ""))) for h in hooks)
+    return hooks if isinstance(hooks, list) else []
 
 
 def load_settings():
@@ -782,7 +821,13 @@ def save_settings(settings):
 def strip_ours(settings):
     hooks = settings.get("hooks", {})
     for name in ("Stop", "PreToolUse", "PermissionRequest"):
-        kept = [g for g in hooks.get(name, []) if not is_ours(g)]
+        kept = []
+        for group in hooks.get(name, []):
+            theirs = [h for h in hooks_in(group) if not is_ours(h)]
+            if len(theirs) == len(hooks_in(group)):
+                kept.append(group)  # none of ours in it: leave it exactly as it is
+            elif theirs:
+                kept.append({**group, "hooks": theirs})
         if kept:
             hooks[name] = kept
         else:
@@ -887,7 +932,7 @@ def cmd_scan(args):
         info, meta = live.get(session_id, {}), desktop.get(session_id, {})
         if info.get("status") == "busy" or meta.get("isArchived"):
             continue
-        rows = read_tail(path, 1_500_000)
+        rows, _ = read_stopped(path, 1_500_000)
         entrypoint = next((r["entrypoint"] for r in reversed(rows) if r.get("entrypoint")), None)
         if "*" not in ENTRYPOINTS and entrypoint not in ENTRYPOINTS:
             continue
@@ -953,7 +998,8 @@ def reviewer_status():
 
 def cmd_status(_):
     try:
-        installed = "yes" if any(is_ours(g) for g in load_settings().get("hooks", {}).get("Stop", [])) else "no"
+        stop = load_settings().get("hooks", {}).get("Stop", [])
+        installed = "yes" if any(is_ours(h) for group in stop for h in hooks_in(group)) else "no"
     except SystemExit as e:
         installed = f"unknown. {e}"
     print(f"installed: {installed}")
